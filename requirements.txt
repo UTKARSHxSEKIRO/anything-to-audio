@@ -1,0 +1,9 @@
+# Core numerical and scientific computing
+numpy>=1.23.0
+scipy>=1.9.0
+
+# Cryptographic primitives (PBKDF2, AES-GCM)
+cryptography>=41.0.0
+
+# Audio format handling and manipulation
+pydub>=0.25.1
