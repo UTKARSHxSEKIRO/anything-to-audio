@@ -9,248 +9,211 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from pydub import AudioSegment
 
-# ----------------- Acoustic / FSK Settings -----------------
+# basic sound setup
 SAMPLE_RATE = 44100
-BAUD_RATE = 100                 # 100 bits/sec (resilient against lossy MP3 compression)
-SAMPLES_PER_BIT = int(SAMPLE_RATE / BAUD_RATE)
+SPEED = 100
+SAMPLES_PER_BIT = int(SAMPLE_RATE / SPEED)
 
-FREQ_MARK = 2400                # Bit 1 (Hz)
-FREQ_SPACE = 1200               # Bit 0 (Hz)
-PREAMBLE = b"\xAA\xAA\xAA\xAA"   # Synchronization bit pattern
+HIGH_TONE = 2400
+LOW_TONE = 1200
+START_CODE = b"\xAA\xAA\xAA\xAA"
 
-# ----------------- Crypto Helpers -----------------
-def derive_key(passphrase: str, salt: bytes) -> bytes:
-    """Derives a 256-bit AES key from a passphrase using PBKDF2."""
-    kdf = PBKDF2HMAC(
+def make_key(secret_word: str, salt: bytes) -> bytes:
+    hasher = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
         iterations=100_000,
     )
-    return kdf.derive(passphrase.encode('utf-8'))
+    return hasher.derive(secret_word.encode("utf-8"))
 
-def encrypt_payload(plaintext: str, passphrase: str) -> bytes:
+def lock_text(plain_words: str, secret_word: str) -> bytes:
     salt = os.urandom(16)
-    key = derive_key(passphrase, salt)
-    aesgcm = AESGCM(key)
-    nonce = os.urandom(12)
-    ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
-    
-    # Format: PREAMBLE + [Length (2B)] + [Salt (16B)] + [Nonce (12B)] + [Ciphertext + Tag]
-    payload = struct.pack("!H", len(ciphertext)) + salt + nonce + ciphertext
-    return PREAMBLE + payload
+    key = make_key(secret_word, salt)
+    lock = AESGCM(key)
+    tag = os.urandom(12)
+    locked_data = lock.encrypt(tag, plain_words.encode("utf-8"), None)
+    return START_CODE + struct.pack("!H", len(locked_data)) + salt + tag + locked_data
 
-def decrypt_payload(payload: bytes, passphrase: str) -> str:
-    # Unpack header
-    length = struct.unpack("!H", payload[:2])[0]
-    salt = payload[2:18]
-    nonce = payload[18:30]
-    ciphertext = payload[30:30 + length]
+def unlock_text(raw_data: bytes, secret_word: str) -> str:
+    total_len = struct.unpack("!H", raw_data[:2])[0]
+    salt = raw_data[2:18]
+    tag = raw_data[18:30]
+    locked_data = raw_data[30:30 + total_len]
 
-    key = derive_key(passphrase, salt)
-    aesgcm = AESGCM(key)
-    decrypted = aesgcm.decrypt(nonce, ciphertext, None)
-    return decrypted.decode('utf-8')
+    key = make_key(secret_word, salt)
+    lock = AESGCM(key)
+    plain_bytes = lock.decrypt(tag, locked_data, None)
+    return plain_bytes.decode("utf-8")
 
-# ----------------- DSP / Audio Modulation -----------------
-def modulate_to_mp3(data: bytes, output_path: str):
+def turn_data_to_audio(data: bytes, file_name: str):
     bits = []
-    for byte in data:
+    for single_byte in data:
         for i in range(7, -1, -1):
-            bits.append((byte >> i) & 1)
+            bits.append((single_byte >> i) & 1)
 
-    t = np.arange(SAMPLES_PER_BIT) / SAMPLE_RATE
-    wave_mark = np.sin(2 * np.pi * FREQ_MARK * t)
-    wave_space = np.sin(2 * np.pi * FREQ_SPACE * t)
+    time_steps = np.arange(SAMPLES_PER_BIT) / SAMPLE_RATE
+    one_sound = np.sin(2 * np.pi * HIGH_TONE * time_steps)
+    zero_sound = np.sin(2 * np.pi * LOW_TONE * time_steps)
 
-    audio_samples = []
-    for bit in bits:
-        audio_samples.extend(wave_mark if bit == 1 else wave_space)
+    all_sounds = []
+    for b in bits:
+        all_sounds.extend(one_sound if b == 1 else zero_sound)
 
-    audio_array = np.array(audio_samples, dtype=np.float32)
-    temp_wav = "temp_render.wav"
-    wavfile.write(temp_wav, SAMPLE_RATE, (audio_array * 32767).astype(np.int16))
+    sound_list = np.array(all_sounds, dtype=np.float32)
+    temp_file = "temp_render.wav"
+    wavfile.write(temp_file, SAMPLE_RATE, (sound_list * 32767).astype(np.int16))
 
-    # Convert to MP3
-    sound = AudioSegment.from_wav(temp_wav)
-    sound.export(output_path, format="mp3", bitrate="192k")
+    loaded_sound = AudioSegment.from_wav(temp_file)
+    loaded_sound.export(file_name, format="mp3", bitrate="192k")
 
-    if os.path.exists(temp_wav):
-        os.remove(temp_wav)
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
 
-def demodulate_from_audio(audio_path: str) -> bytes:
-    sound = AudioSegment.from_file(audio_path)
-    samples = np.array(sound.get_array_of_samples(), dtype=np.float32)
+def turn_audio_to_data(file_name: str) -> bytes:
+    loaded_sound = AudioSegment.from_file(file_name)
+    all_numbers = np.array(loaded_sound.get_array_of_samples(), dtype=np.float32)
 
-    num_bits = len(samples) // SAMPLES_PER_BIT
-    recovered_bits = []
+    total_bits = len(all_numbers) // SAMPLES_PER_BIT
+    read_bits = []
 
-    t = np.arange(SAMPLES_PER_BIT) / SAMPLE_RATE
-    ref_mark = np.exp(-2j * np.pi * FREQ_MARK * t)
-    ref_space = np.exp(-2j * np.pi * FREQ_SPACE * t)
+    time_steps = np.arange(SAMPLES_PER_BIT) / SAMPLE_RATE
+    one_check = np.exp(-2j * np.pi * HIGH_TONE * time_steps)
+    zero_check = np.exp(-2j * np.pi * LOW_TONE * time_steps)
 
-    for i in range(num_bits):
-        chunk = samples[i * SAMPLES_PER_BIT : (i + 1) * SAMPLES_PER_BIT]
-        energy_mark = np.abs(np.dot(chunk, ref_mark))
-        energy_space = np.abs(np.dot(chunk, ref_space))
-        recovered_bits.append(1 if energy_mark > energy_space else 0)
+    for i in range(total_bits):
+        part = all_numbers[i * SAMPLES_PER_BIT : (i + 1) * SAMPLES_PER_BIT]
+        one_energy = np.abs(np.dot(part, one_check))
+        zero_energy = np.abs(np.dot(part, zero_check))
+        read_bits.append(1 if one_energy > zero_energy else 0)
 
-    raw_bytes = bytearray()
-    for i in range(0, len(recovered_bits) - 7, 8):
-        byte_val = 0
-        for bit in recovered_bits[i:i + 8]:
-            byte_val = (byte_val << 1) | bit
-        raw_bytes.append(byte_val)
+    found_bytes = bytearray()
+    for i in range(0, len(read_bits) - 7, 8):
+        byte_num = 0
+        for b in read_bits[i:i + 8]:
+            byte_num = (byte_num << 1) | b
+        found_bytes.append(byte_num)
 
-    preamble_idx = bytes(raw_bytes).find(PREAMBLE)
-    if preamble_idx == -1:
-        raise ValueError("No valid transmission preamble detected in audio.")
+    start_spot = bytes(found_bytes).find(START_CODE)
+    if start_spot == -1:
+        raise ValueError("Couldn't find the starting beep pattern.")
 
-    return bytes(raw_bytes[preamble_idx + len(PREAMBLE):])
+    return bytes(found_bytes[start_spot + len(START_CODE):])
 
-# ----------------- GUI Code -----------------
-class App(tk.Tk):
+class SimpleTextAudioApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic Crypto Modem")
+        self.title("Text to Sound Tool")
         self.geometry("620x540")
         self.resizable(False, False)
 
-        # Style configuration
-        style = ttk.Style(self)
-        style.theme_use("clam")
+        tabs = ttk.Notebook(self)
+        tabs.pack(fill="both", expand=True, padx=12, pady=12)
 
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        self.tab_hide = ttk.Frame(tabs)
+        self.tab_read = ttk.Frame(tabs)
 
-        self.tab_encode = ttk.Frame(notebook)
-        self.tab_decode = ttk.Frame(notebook)
+        tabs.add(self.tab_hide, text=" Turn Text to Sound ")
+        tabs.add(self.tab_read, text=" Read Sound Back to Text ")
 
-        notebook.add(self.tab_encode, text="  Encode & Transmit  ")
-        notebook.add(self.tab_decode, text="  Receive & Decode  ")
+        self.build_hide_screen()
+        self.build_read_screen()
 
-        self.setup_encode_ui()
-        self.setup_decode_ui()
+    def build_hide_screen(self):
+        ttk.Label(self.tab_hide, text="Write your message:").pack(anchor="w", padx=15, pady=(15, 2))
+        self.box_input = tk.Text(self.tab_hide, height=6, width=65, wrap="word")
+        self.box_input.pack(padx=15, pady=5)
 
-    def setup_encode_ui(self):
-        # Plaintext input
-        lbl_msg = ttk.Label(self.tab_encode, text="Secret Message:", font=("Arial", 10, "bold"))
-        lbl_msg.pack(anchor="w", padx=15, pady=(15, 2))
-        
-        self.txt_message = tk.Text(self.tab_encode, height=6, width=65, wrap="word")
-        self.txt_message.pack(padx=15, pady=5)
+        ttk.Label(self.tab_hide, text="Password:").pack(anchor="w", padx=15, pady=(10, 2))
+        self.pass_box = ttk.Entry(self.tab_hide, show="*", width=45)
+        self.pass_box.pack(anchor="w", padx=15, pady=5)
 
-        # Passphrase input
-        lbl_pwd = ttk.Label(self.tab_encode, text="Encryption Password / Key:", font=("Arial", 10, "bold"))
-        lbl_pwd.pack(anchor="w", padx=15, pady=(10, 2))
-        
-        self.entry_enc_pwd = ttk.Entry(self.tab_encode, show="*", width=45)
-        self.entry_enc_pwd.pack(anchor="w", padx=15, pady=5)
+        ttk.Button(self.tab_hide, text="Save as MP3", command=self.save_mp3).pack(pady=20)
+        self.status_hide = ttk.Label(self.tab_hide, text="")
+        self.status_hide.pack()
 
-        # Action button
-        btn_encode = ttk.Button(self.tab_encode, text="Generate .MP3 Signal", command=self.handle_encode)
-        btn_encode.pack(pady=20)
+    def build_read_screen(self):
+        ttk.Label(self.tab_read, text="Pick the sound file (.mp3 or .wav):").pack(anchor="w", padx=15, pady=(15, 2))
+        row = ttk.Frame(self.tab_read)
+        row.pack(fill="x", padx=15, pady=5)
 
-        self.lbl_enc_status = ttk.Label(self.tab_encode, text="", foreground="blue")
-        self.lbl_enc_status.pack()
+        self.file_box = ttk.Entry(row, width=48)
+        self.file_box.pack(side="left", fill="x", expand=True)
 
-    def setup_decode_ui(self):
-        # File selector
-        lbl_file = ttk.Label(self.tab_decode, text="Select Audio File (.mp3 / .wav):", font=("Arial", 10, "bold"))
-        lbl_file.pack(anchor="w", padx=15, pady=(15, 2))
+        ttk.Button(row, text="Browse", command=self.pick_sound).pack(side="left", padx=(8, 0))
 
-        file_frame = ttk.Frame(self.tab_decode)
-        file_frame.pack(fill="x", padx=15, pady=5)
+        ttk.Label(self.tab_read, text="Password:").pack(anchor="w", padx=15, pady=(10, 2))
+        self.pass_read_box = ttk.Entry(self.tab_read, show="*", width=45)
+        self.pass_read_box.pack(anchor="w", padx=15, pady=5)
 
-        self.entry_file_path = ttk.Entry(file_frame, width=48)
-        self.entry_file_path.pack(side="left", fill="x", expand=True)
+        ttk.Button(self.tab_read, text="Open Message", command=self.open_message).pack(pady=15)
 
-        btn_browse = ttk.Button(file_frame, text="Browse...", command=self.handle_browse)
-        btn_browse.pack(side="left", padx=(8, 0))
+        ttk.Label(self.tab_read, text="Your message:").pack(anchor="w", padx=15, pady=(5, 2))
+        self.box_output = tk.Text(self.tab_read, height=6, width=65, wrap="word", state="disabled")
+        self.box_output.pack(padx=15, pady=5)
 
-        # Passphrase input
-        lbl_pwd = ttk.Label(self.tab_decode, text="Decryption Password / Key:", font=("Arial", 10, "bold"))
-        lbl_pwd.pack(anchor="w", padx=15, pady=(10, 2))
+    def save_mp3(self):
+        text = self.box_input.get("1.0", tk.END).strip()
+        pwd = self.pass_box.get().strip()
 
-        self.entry_dec_pwd = ttk.Entry(self.tab_decode, show="*", width=45)
-        self.entry_dec_pwd.pack(anchor="w", padx=15, pady=5)
-
-        # Action button
-        btn_decode = ttk.Button(self.tab_decode, text="Demodulate & Decrypt", command=self.handle_decode)
-        btn_decode.pack(pady=15)
-
-        # Output text
-        lbl_out = ttk.Label(self.tab_decode, text="Decoded Message:", font=("Arial", 10, "bold"))
-        lbl_out.pack(anchor="w", padx=15, pady=(5, 2))
-
-        self.txt_decoded = tk.Text(self.tab_decode, height=6, width=65, wrap="word", state="disabled")
-        self.txt_decoded.pack(padx=15, pady=5)
-
-    def handle_encode(self):
-        msg = self.txt_message.get("1.0", tk.END).strip()
-        pwd = self.entry_enc_pwd.get().strip()
-
-        if not msg:
-            messagebox.showwarning("Warning", "Please enter a message to encode.")
+        if not text:
+            messagebox.showwarning("Empty", "Type something first.")
             return
         if not pwd:
-            messagebox.showwarning("Warning", "Please enter a password.")
+            messagebox.showwarning("Empty", "Type a password.")
             return
 
-        save_path = filedialog.asksaveasfilename(
+        where = filedialog.asksaveasfilename(
             defaultextension=".mp3",
-            filetypes=[("MP3 Audio Files", "*.mp3"), ("All Files", "*.*")],
-            title="Save Modulated MP3"
+            filetypes=[("Sound files", "*.mp3"), ("All", "*.*")],
+            title="Where to save sound"
         )
-        if not save_path:
+        if not where:
             return
 
         try:
-            self.lbl_enc_status.config(text="Modulating to audio... please wait.")
+            self.status_hide.config(text="Writing audio...")
             self.update_idletasks()
-            
-            payload = encrypt_payload(msg, pwd)
-            modulate_to_mp3(payload, save_path)
-            
-            self.lbl_enc_status.config(text="")
-            messagebox.showinfo("Success", f"Signal generated successfully:\n{save_path}")
-        except Exception as e:
-            self.lbl_enc_status.config(text="")
-            messagebox.showerror("Error", f"Failed to encode: {e}")
+            packed = lock_text(text, pwd)
+            turn_data_to_audio(packed, where)
+            self.status_hide.config(text="")
+            messagebox.showinfo("Done", f"Saved to:\n{where}")
+        except Exception as err:
+            self.status_hide.config(text="")
+            messagebox.showerror("Error", f"Failed: {err}")
 
-    def handle_browse(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Audio Files", "*.mp3 *.wav"), ("All Files", "*.*")],
-            title="Select Signal File"
+    def pick_sound(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Audio", "*.mp3 *.wav"), ("All", "*.*")],
+            title="Pick a sound file"
         )
-        if file_path:
-            self.entry_file_path.delete(0, tk.END)
-            self.entry_file_path.insert(0, file_path)
+        if path:
+            self.file_box.delete(0, tk.END)
+            self.file_box.insert(0, path)
 
-    def handle_decode(self):
-        audio_path = self.entry_file_path.get().strip()
-        pwd = self.entry_dec_pwd.get().strip()
+    def open_message(self):
+        path = self.file_box.get().strip()
+        pwd = self.pass_read_box.get().strip()
 
-        if not audio_path or not os.path.exists(audio_path):
-            messagebox.showwarning("Warning", "Please select a valid audio file.")
+        if not path or not os.path.exists(path):
+            messagebox.showwarning("Missing", "Select an actual file first.")
             return
         if not pwd:
-            messagebox.showwarning("Warning", "Please provide the decryption password.")
+            messagebox.showwarning("Missing", "Type the password.")
             return
 
         try:
-            raw_payload = demodulate_from_audio(audio_path)
-            plaintext = decrypt_payload(raw_payload, pwd)
+            raw_bytes = turn_audio_to_data(path)
+            message = unlock_text(raw_bytes, pwd)
 
-            self.txt_decoded.config(state="normal")
-            self.txt_decoded.delete("1.0", tk.END)
-            self.txt_decoded.insert(tk.END, plaintext)
-            self.txt_decoded.config(state="disabled")
-
-            messagebox.showinfo("Success", "Audio demodulated and payload decrypted successfully!")
-        except Exception as e:
-            messagebox.showerror("Error", f"Demodulation/Decryption failed:\n{e}\n\n(Verify that the password is correct and file is untampered)")
+            self.box_output.config(state="normal")
+            self.box_output.delete("1.0", tk.END)
+            self.box_output.insert(tk.END, message)
+            self.box_output.config(state="disabled")
+            messagebox.showinfo("Done", "Message read successfully.")
+        except Exception as err:
+            messagebox.showerror("Error", f"Could not read it: {err}\n\n(Wrong password or broken sound file)")
 
 if __name__ == "__main__":
-    app = App()
+    app = SimpleTextAudioApp()
     app.mainloop()
